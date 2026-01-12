@@ -104,7 +104,28 @@ async def get_task_status(task_id: str):
             progress = 100
             message = "Optimization completed"
             result_data = task_result.result
-            # TODO: Convert result_data to OptimizationResults schema
+            # Extract results from task result
+            results = None
+            if isinstance(result_data, dict) and "results" in result_data:
+                results_dict = result_data["results"]
+                # Convert to OptimizationResults schema
+                monthly_revenues = [
+                    {
+                        "year": mr["year"],
+                        "month": mr["month"],
+                        "revenue": mr["revenue"]
+                    }
+                    for mr in results_dict.get("monthly_revenues", [])
+                ]
+                results = OptimizationResults(
+                    optimal_pv_size_mw=results_dict.get("optimal_pv_size_mw", 0),
+                    optimal_bess_size_mwh=results_dict.get("optimal_bess_size_mwh", 0),
+                    npv=results_dict.get("npv", 0),
+                    irr=results_dict.get("irr", 0),
+                    capex_total=results_dict.get("capex_total", 0),
+                    monthly_revenues=monthly_revenues,
+                    total_revenue_25_years=results_dict.get("total_revenue_25_years", 0),
+                )
         elif task_result.state == "FAILURE":
             status = "failed"
             progress = 0
@@ -119,7 +140,7 @@ async def get_task_status(task_id: str):
             status=status,
             progress=progress,
             message=message,
-            results=None  # TODO: Add results when task completes
+            results=results if status == "completed" else None
         )
         
         return response
@@ -145,9 +166,36 @@ async def get_task_results(task_id: str):
         
         result_data = task_result.result
         
-        # TODO: Convert result_data to OptimizationResults schema
-        # For now, raise not implemented
-        raise HTTPException(status_code=501, detail="Results processing not yet implemented")
+        # Extract results from task result
+        if not isinstance(result_data, dict) or "results" not in result_data:
+            raise HTTPException(
+                status_code=500,
+                detail="Invalid result format from task"
+            )
+        
+        results_dict = result_data["results"]
+        
+        # Convert to OptimizationResults schema
+        monthly_revenues = [
+            {
+                "year": mr["year"],
+                "month": mr["month"],
+                "revenue": mr["revenue"]
+            }
+            for mr in results_dict.get("monthly_revenues", [])
+        ]
+        
+        results = OptimizationResults(
+            optimal_pv_size_mw=results_dict.get("optimal_pv_size_mw", 0),
+            optimal_bess_size_mwh=results_dict.get("optimal_bess_size_mwh", 0),
+            npv=results_dict.get("npv", 0),
+            irr=results_dict.get("irr", 0),
+            capex_total=results_dict.get("capex_total", 0),
+            monthly_revenues=monthly_revenues,
+            total_revenue_25_years=results_dict.get("total_revenue_25_years", 0),
+        )
+        
+        return results
         
     except HTTPException:
         raise
