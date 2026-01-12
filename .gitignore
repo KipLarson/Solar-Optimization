@@ -58,6 +58,8 @@ celerybeat.pid
 # Uploaded files (CSV files)
 uploads/
 *.csv
+# Exception: allow sample data CSV files for testing
+!sample_data/*.csv
 
 # OS
 .DS_Store
