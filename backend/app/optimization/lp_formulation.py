@@ -2,8 +2,11 @@
 from typing import Dict, Any, Tuple
 import pulp
 import pandas as pd
+import logging
 from app.models.battery import BatteryModel
 from app.models.pv_system import PVSystemModel
+
+logger = logging.getLogger(__name__)
 
 
 class LPFormulation:
@@ -103,7 +106,8 @@ class LPFormulation:
         self.variables['battery_to_onsite'] = {}
         self.variables['grid_to_battery'] = {}
         self.variables['soc'] = {}
-        self.variables['battery_charging'] = {}  # Binary variable
+        # Note: Removed binary variables - battery can charge and discharge simultaneously
+        # This simplifies MILP to LP, making it much faster
         
         for year in self.years:
             for hour in self.hours:
@@ -130,11 +134,6 @@ class LPFormulation:
                 # State of charge
                 self.variables['soc'][(hour, year)] = pulp.LpVariable(
                     f'soc_h{hour}_y{year}', lowBound=0, cat='Continuous'
-                )
-                
-                # Binary variable for battery mode (1 = charging, 0 = discharging)
-                self.variables['battery_charging'][(hour, year)] = pulp.LpVariable(
-                    f'battery_charging_h{hour}_y{year}', cat='Binary'
                 )
         
         # Initial SOC for year 1
@@ -195,9 +194,9 @@ class LPFormulation:
     
     def _create_constraints(self):
         """Create all constraints."""
-        # Big M for battery mode constraint (large number, must exceed max possible charge/discharge)
-        # Use a fixed large number since bess_size is a variable
-        big_m = 10000  # Large number that exceeds max possible energy flows
+        # Note: Removed binary variables and big-M constraints for battery mode exclusivity
+        # Battery can now charge and discharge simultaneously (LP instead of MILP)
+        # This makes the problem much faster to solve
         
         for year in self.years:
             # Price escalation for this year
@@ -255,19 +254,52 @@ class LPFormulation:
                 # Constraint 5: Battery SOC Bounds
                 self.problem += soc_end <= self.variables['bess_size'], f"SOC_max_h{hour}_y{year}"
                 
-                # Constraint 6: Battery Mode (charge OR discharge, not both)
-                # If charging (battery_charging = 1), discharge must be 0
-                charge_total = (
-                    self.variables['pv_to_battery'][(hour, year)] +
-                    self.variables['grid_to_battery'][(hour, year)]
-                )
-                discharge_total = (
-                    self.variables['battery_to_grid'][(hour, year)] +
-                    self.variables['battery_to_onsite'][(hour, year)]
-                )
+                # Constraint 5b: Prevent battery operations when bess_size = 0
+                # Use a large M value to enforce: if bess_size = 0, then all battery flows = 0
+                # M should be larger than max possible battery operations
+                big_m_battery = 10000  # Large enough to exceed max possible battery operations
                 
-                self.problem += charge_total <= big_m * self.variables['battery_charging'][(hour, year)], f"Charge_mode_h{hour}_y{year}"
-                self.problem += discharge_total <= big_m * (1 - self.variables['battery_charging'][(hour, year)]), f"Discharge_mode_h{hour}_y{year}"
+                # If bess_size = 0, then battery flows must be 0
+                # We use: flow <= big_m * bess_size (when bess_size = 0, flow must be 0)
+                # But we need to normalize: flow <= big_m * (bess_size / max_bess_size_expected)
+                # For simplicity, use: flow <= big_m * bess_size (this works if bess_size is in reasonable range)
+                # Actually, better approach: use a constraint that's active when bess_size is small
+                # For now, use a simpler approach: ensure battery flows are bounded by bess_size
+                # But this doesn't work well because bess_size can be 0
+                
+                # Better: Add explicit constraint that battery flows are 0 when bess_size = 0
+                # We'll use indicator constraints via big-M: flow <= M * indicator, where indicator = 1 if bess_size > epsilon
+                # Simpler: Just bound flows by a multiple of bess_size
+                # Actually, the SOC constraint should handle this, but it's not working because
+                # the battery can charge and discharge simultaneously, keeping SOC at 0
+                
+                # Fix: Add constraints that prevent battery operations when bess_size is effectively 0
+                # Use: battery_flow <= big_m * (bess_size / 1.0)  - this ensures if bess_size = 0, flows = 0
+                # But we need to be careful about units - bess_size is in MWh, flows are in MWh
+                # So: flow <= big_m * bess_size works, but big_m needs to be in 1/MWh units
+                # Actually, if bess_size is in MWh and flows are in MWh, we can use:
+                # flow <= big_m * bess_size where big_m is dimensionless but large
+                # But this creates a very loose bound when bess_size > 0
+                
+                # Better approach: Use a threshold - if bess_size < epsilon, force flows to 0
+                # But this requires binary variables or indicator constraints
+                
+                # Simplest fix: Bound each battery flow by bess_size with a reasonable multiplier
+                # This ensures that when bess_size = 0, flows must be 0
+                # The multiplier should be based on max C-rate (charge/discharge rate)
+                # For idealized battery, we can use a large multiplier, but it's better to use
+                # the actual constraint: flows are bounded by what the battery can physically do
+                
+                # For now, add a constraint that battery flows are bounded by bess_size
+                # This prevents the "free energy" exploit
+                max_c_rate = 4.0  # Assume max 4-hour charge/discharge rate (conservative)
+                self.problem += energy_in <= max_c_rate * self.variables['bess_size'], f"Battery_charge_limit_h{hour}_y{year}"
+                self.problem += energy_out <= max_c_rate * self.variables['bess_size'], f"Battery_discharge_limit_h{hour}_y{year}"
+                
+                # Note: Removed Constraint 6 (battery mode exclusivity)
+                # Battery can now charge and discharge simultaneously
+                # This is acceptable for planning purposes - the optimizer will choose
+                # the economically optimal behavior
                 
                 # Year-to-year SOC continuity
                 if hour == self.num_hours and year < self.num_years:
@@ -308,6 +340,44 @@ class LPFormulation:
                 'npv': pulp.value(self.problem.objective),
                 'status': 'optimal'
             }
+            
+            # Analyze solution for simultaneous charge/discharge
+            simultaneous_count = self._count_simultaneous_charge_discharge()
+            solution['simultaneous_charge_discharge_hours'] = simultaneous_count
+            
+            if simultaneous_count > 0:
+                logger.info(f"Solution has {simultaneous_count} hours with simultaneous charge/discharge "
+                          f"out of {self.num_hours * self.num_years} total hours")
+            else:
+                logger.info("No simultaneous charge/discharge detected - optimizer chose mutually exclusive operations")
+            
             return pulp.LpStatus[status], solution
         else:
             return pulp.LpStatus[status], None
+    
+    def _count_simultaneous_charge_discharge(self) -> int:
+        """
+        Count number of hours where battery simultaneously charges and discharges.
+        
+        Returns:
+            Number of hours with simultaneous charge/discharge
+        """
+        count = 0
+        threshold = 1e-6  # Small threshold to account for floating point precision
+        
+        for year in self.years:
+            for hour in self.hours:
+                # Get charge and discharge values
+                charge_pv = pulp.value(self.variables['pv_to_battery'].get((hour, year), 0)) or 0
+                charge_grid = pulp.value(self.variables['grid_to_battery'].get((hour, year), 0)) or 0
+                discharge_grid = pulp.value(self.variables['battery_to_grid'].get((hour, year), 0)) or 0
+                discharge_onsite = pulp.value(self.variables['battery_to_onsite'].get((hour, year), 0)) or 0
+                
+                total_charge = charge_pv + charge_grid
+                total_discharge = discharge_grid + discharge_onsite
+                
+                # Count if both charging and discharging (above threshold)
+                if total_charge > threshold and total_discharge > threshold:
+                    count += 1
+        
+        return count
